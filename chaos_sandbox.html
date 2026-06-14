@@ -305,6 +305,7 @@ input[type="range"]::-moz-range-thumb {
         <button class="tool-btn danger" id="sel-delete">Delete</button>
         <button class="tool-btn" id="sel-freeze">Gravity Off</button>
         <button class="tool-btn" id="sel-unfreeze">Gravity On</button>
+        <button class="tool-btn span-2" id="sel-reverse">⟲ Reverse Gravity</button>
         <button class="tool-btn span-2" id="sel-deselect">Deselect</button>
       </div>
       <div class="hint" id="float-hint" style="display:none;">Click the canvas to place. Press Esc to cancel.</div>
@@ -335,6 +336,7 @@ input[type="range"]::-moz-range-thumb {
         <li>Too few Levitite and it falls; too many and it flips skyward.</li>
         <li>Select: drag a box, then move, copy, delete, or toggle gravity.</li>
         <li>Gravity-off blocks hang in the air — and anchor Levitite islands.</li>
+        <li>Reverse Gravity makes sand and liquids fall upward.</li>
         <li>The chaos element does what it wants.</li>
       </ul>
     </div>
@@ -421,7 +423,10 @@ const CHAOS_MENU = [
 ];
 
 // World state
-let grid, life, tint, moved, frozen, struct, visited;
+let grid, life, tint, moved, frozen, rev, struct, visited;
+// Preallocated scratch for the Levitite structure pass — avoids per-frame
+// allocation (GC stalls) on very large structures.
+let memberMark, sBufG, sBufL, sBufT, sBufF, sBufR;
 let frame = 0;
 let scanRight = true;
 let levititeCount = 0;   // skip the structure pass entirely when zero
@@ -434,8 +439,12 @@ function initWorld() {
   tint = new Uint8Array(n);
   moved = new Uint8Array(n);
   frozen = new Uint8Array(n);   // 1 = gravity off (suspended)
+  rev = new Uint8Array(n);      // 1 = reversed gravity (falls upward)
   struct = new Uint8Array(n);   // 1 = part of a Levitite structure this frame
   visited = new Uint8Array(n);  // scratch for flood fill
+  memberMark = new Uint8Array(n);
+  sBufG = new Uint8Array(n); sBufL = new Uint8Array(n); sBufT = new Uint8Array(n);
+  sBufF = new Uint8Array(n); sBufR = new Uint8Array(n);
   frame = 0;
   levititeCount = 0;
   plans = [];
@@ -456,6 +465,7 @@ function setCell(x, y, el) {
   adjustLevCount(grid[i], el);
   grid[i] = el;
   frozen[i] = 0;
+  rev[i] = 0;
   struct[i] = 0;
   tint[i] = (Math.random() * 256) | 0;
   if (el === E.FIRE) life[i] = 40 + ((Math.random() * 70) | 0);
@@ -465,9 +475,9 @@ function setCell(x, y, el) {
 }
 
 // Place a cell verbatim (used by copy/paste/move so appearance is preserved)
-function placeCell(i, el, lf, tn, fr) {
+function placeCell(i, el, lf, tn, fr, rv) {
   adjustLevCount(grid[i], el);
-  grid[i] = el; life[i] = lf; tint[i] = tn; frozen[i] = fr; struct[i] = 0;
+  grid[i] = el; life[i] = lf; tint[i] = tn; frozen[i] = fr; rev[i] = rv; struct[i] = 0;
 }
 
 function paint(cx, cy, r, el) {
@@ -493,6 +503,7 @@ function swap(i, j) {
   t = life[i]; life[i] = life[j]; life[j] = t;
   t = tint[i]; tint[i] = tint[j]; tint[j] = t;
   t = frozen[i]; frozen[i] = frozen[j]; frozen[j] = t;
+  t = rev[i]; rev[i] = rev[j]; rev[j] = t;
   moved[i] = 1; moved[j] = 1;
 }
 
@@ -612,14 +623,16 @@ function analyzeLevitation() {
     // Decide the structure's vertical intent
     let dir = 0;
     if (B > 0 && !hasFrozen) {            // B==0 (all Levitite) or anchored → just floats
-      const excess = L * 9 - B;           // >0 over-lifted, <0 too heavy
-      if (excess <= -9) dir = 1;          // a full Levitite short → fall
-      else if (excess >= 9) dir = -1;     // a full Levitite over → rise
+      // Each Levitite lifts 9 blocks. Exactly 1-per-9 (capacity == mass) floats;
+      // ANY extra Levitite inverts gravity (rises); any shortfall falls.
+      const excess = L * 9 - B;           // >0 over-lifted (invert), <0 too heavy
+      if (excess > 0) dir = -1;           // too much lift → rise / invert
+      else if (excess < 0) dir = 1;       // too little lift → fall
       if (dir !== 0) {
-        const s = Math.abs(excess) - 8;            // strength past the float band (>=1)
-        // Move one cell every `interval` frames: s=1 → every 8 frames (slow drift),
-        // s>=8 → every frame (fast). The bigger the imbalance, the faster it goes.
-        const interval = Math.max(1, Math.min(8, 9 - s));
+        // Speed scales with how far from balance: just-off drifts slowly,
+        // way-off moves every frame.
+        const s = Math.abs(excess);                       // >= 1
+        const interval = Math.max(1, Math.min(12, 13 - s));
         if (frame % interval !== 0) dir = 0;
       }
     }
@@ -629,23 +642,32 @@ function analyzeLevitation() {
 
 function moveStructure(comp, dir) {
   const off = dir * GW;
-  const member = new Set(comp);
+  const len = comp.length;
+  // Mark this component's own cells (reused buffer — no per-frame allocation)
+  for (let k = 0; k < len; k++) memberMark[comp[k]] = 1;
   // Validate: every cell can move (in bounds, target empty or a vacating member)
-  for (let k = 0; k < comp.length; k++) {
+  let ok = true;
+  for (let k = 0; k < len; k++) {
     const ci = comp[k];
     const ny = ((ci / GW) | 0) + dir;
-    if (ny < 0 || ny >= GH) return;                 // hit floor / ceiling
+    if (ny < 0 || ny >= GH) { ok = false; break; }       // hit floor / ceiling
     const ti = ci + off;
-    if (grid[ti] !== E.EMPTY && !member.has(ti)) return; // blocked by foreign solid
+    if (grid[ti] !== E.EMPTY && !memberMark[ti]) { ok = false; break; } // blocked
   }
+  for (let k = 0; k < len; k++) memberMark[comp[k]] = 0;  // always clear marks
+  if (!ok) return;
   // Snapshot, clear, write (multiset of elements is preserved → no count change)
-  const len = comp.length;
-  const sg = new Uint8Array(len), sl = new Uint8Array(len), st = new Uint8Array(len), sf = new Uint8Array(len);
-  for (let k = 0; k < len; k++) { const ci = comp[k]; sg[k] = grid[ci]; sl[k] = life[ci]; st[k] = tint[ci]; sf[k] = frozen[ci]; }
-  for (let k = 0; k < len; k++) { const ci = comp[k]; grid[ci] = E.EMPTY; life[ci] = 0; tint[ci] = 0; frozen[ci] = 0; struct[ci] = 0; }
+  for (let k = 0; k < len; k++) {
+    const ci = comp[k];
+    sBufG[k] = grid[ci]; sBufL[k] = life[ci]; sBufT[k] = tint[ci]; sBufF[k] = frozen[ci]; sBufR[k] = rev[ci];
+  }
+  for (let k = 0; k < len; k++) {
+    const ci = comp[k];
+    grid[ci] = E.EMPTY; life[ci] = 0; tint[ci] = 0; frozen[ci] = 0; rev[ci] = 0; struct[ci] = 0;
+  }
   for (let k = 0; k < len; k++) {
     const ti = comp[k] + off;
-    grid[ti] = sg[k]; life[ti] = sl[k]; tint[ti] = st[k]; frozen[ti] = sf[k]; moved[ti] = 1;
+    grid[ti] = sBufG[k]; life[ti] = sBufL[k]; tint[ti] = sBufT[k]; frozen[ti] = sBufF[k]; rev[ti] = sBufR[k]; moved[ti] = 1;
   }
 }
 
@@ -655,10 +677,12 @@ function applyLevitation() {
 
 // ── Per-element behaviors ──────────────────────────────────────────
 
-function tryFall(i, x, y, el) {
-  // Returns true if the cell moved. Powder/liquid falling with density swaps.
-  if (y + 1 >= GH) return false;
-  const below = idx(x, y + 1);
+function tryFall(i, x, y, el, gd) {
+  // Returns true if the cell moved. gd = gravity direction (+1 down; -1 up for
+  // reversed-gravity cells). Powder/liquid falling with density swaps.
+  const ny = y + gd;
+  if (ny < 0 || ny >= GH) return false;
+  const below = idx(x, ny);
   const belEl = grid[below];
 
   if (belEl === E.EMPTY) { swap(i, below); return true; }
@@ -671,12 +695,12 @@ function tryFall(i, x, y, el) {
     if (Math.random() < 0.4) { swap(i, below); return true; }
   }
 
-  // Diagonal slide
+  // Diagonal slide (in the gravity direction)
   const dir = Math.random() < 0.5 ? 1 : -1;
   for (const d of [dir, -dir]) {
     const nx = x + d;
     if (nx < 0 || nx >= GW) continue;
-    const diag = idx(nx, y + 1);
+    const diag = idx(nx, ny);
     if (grid[diag] === E.EMPTY) { swap(i, diag); return true; }
   }
   return false;
@@ -718,22 +742,23 @@ function updateCell(x, y) {
   // Frozen (gravity off) and Levitite-controlled cells skip their own physics
   if (frozen[i] || struct[i]) return;
   const el = grid[i];
+  const gd = rev[i] ? -1 : 1;   // gravity direction for this cell (reversed = up)
 
   switch (el) {
     case E.EMPTY: case E.STONE: case E.WOOD: case E.GLASS: case E.TNT: case E.LEVITITE:
       return;
 
     case E.SAND:
-      tryFall(i, x, y, el);
+      tryFall(i, x, y, el, gd);
       return;
 
     case E.WATER: {
-      if (!tryFall(i, x, y, el)) tryFlow(i, x, y, 0.85);
+      if (!tryFall(i, x, y, el, gd)) tryFlow(i, x, y, 0.85);
       return;
     }
 
     case E.OIL: {
-      if (!tryFall(i, x, y, el)) tryFlow(i, x, y, 0.5);
+      if (!tryFall(i, x, y, el, gd)) tryFlow(i, x, y, 0.5);
       return;
     }
 
@@ -749,7 +774,7 @@ function updateCell(x, y) {
           if (Math.random() < 0.5) { setCell(x, y, E.EMPTY); return; }
         }
       }
-      if (!tryFall(i, x, y, el)) tryFlow(i, x, y, 0.7);
+      if (!tryFall(i, x, y, el, gd)) tryFlow(i, x, y, 0.7);
       return;
     }
 
@@ -770,7 +795,7 @@ function updateCell(x, y) {
         else if (ne === E.TNT) { explode(nx, ny, 10); return; }
         else if (ne === E.SAND && Math.random() < 0.005) setCell(nx, ny, E.GLASS);
       }
-      if (!tryFall(i, x, y, el)) tryFlow(i, x, y, 0.12); // viscous
+      if (!tryFall(i, x, y, el, gd)) tryFlow(i, x, y, 0.12); // viscous
       return;
     }
 
@@ -977,7 +1002,7 @@ function setupUI() {
   // Reallocate the world to a new size, keeping what fits (bottom-left aligned)
   function resizeWorld(key) {
     const oGW = GW, oGH = GH;
-    const og = grid, ol = life, ot = tint, ofz = frozen;
+    const og = grid, ol = life, ot = tint, ofz = frozen, orv = rev;
     GW = SIZES[key].w; GH = SIZES[key].h; currentSize = key;
     initWorld();
     const cw = Math.min(oGW, GW), ch = Math.min(oGH, GH);
@@ -985,7 +1010,7 @@ function setupUI() {
       const oy = oGH - 1 - ry, ny = GH - 1 - ry;
       for (let rx = 0; rx < cw; rx++) {
         const oi = oy * oGW + rx, ni = ny * GW + rx;
-        grid[ni] = og[oi]; life[ni] = ol[oi]; tint[ni] = ot[oi]; frozen[ni] = ofz[oi];
+        grid[ni] = og[oi]; life[ni] = ol[oi]; tint[ni] = ot[oi]; frozen[ni] = ofz[oi]; rev[ni] = orv[oi];
         if (grid[ni] === E.LEVITITE) levititeCount++;
       }
     }
@@ -1011,18 +1036,18 @@ function setupUI() {
 
   function snapshot(b) {
     const g = new Uint8Array(b.w * b.h), l = new Uint8Array(b.w * b.h);
-    const t = new Uint8Array(b.w * b.h), f = new Uint8Array(b.w * b.h);
+    const t = new Uint8Array(b.w * b.h), f = new Uint8Array(b.w * b.h), rv = new Uint8Array(b.w * b.h);
     for (let ry = 0; ry < b.h; ry++) {
       for (let rx = 0; rx < b.w; rx++) {
         const i = idx(b.x + rx, b.y + ry), k = ry * b.w + rx;
-        g[k] = grid[i]; l[k] = life[i]; t[k] = tint[i]; f[k] = frozen[i];
+        g[k] = grid[i]; l[k] = life[i]; t[k] = tint[i]; f[k] = frozen[i]; rv[k] = rev[i];
       }
     }
-    return { w: b.w, h: b.h, g, l, t, f };
+    return { w: b.w, h: b.h, g, l, t, f, r: rv };
   }
 
   function clone(c) {
-    return { w: c.w, h: c.h, g: c.g.slice(), l: c.l.slice(), t: c.t.slice(), f: c.f.slice() };
+    return { w: c.w, h: c.h, g: c.g.slice(), l: c.l.slice(), t: c.t.slice(), f: c.f.slice(), r: c.r.slice() };
   }
 
   function stampFloating(cx, cy) {
@@ -1034,7 +1059,7 @@ function setupUI() {
         const tx = ox + rx, ty = oy + ry;
         if (!inBounds(tx, ty)) continue;
         const k = ry * floating.w + rx;
-        placeCell(idx(tx, ty), el, floating.l[k], floating.t[k], floating.f[k]);
+        placeCell(idx(tx, ty), el, floating.l[k], floating.t[k], floating.f[k], floating.r[k]);
       }
     }
   }
@@ -1095,11 +1120,15 @@ function setupUI() {
   });
   document.getElementById('sel-freeze').addEventListener('click', () => {
     if (!selActive) return;
-    eachSelCell(selBox(), i => { if (grid[i] !== E.EMPTY) frozen[i] = 1; });
+    eachSelCell(selBox(), i => { if (grid[i] !== E.EMPTY) { frozen[i] = 1; rev[i] = 0; } });
   });
   document.getElementById('sel-unfreeze').addEventListener('click', () => {
     if (!selActive) return;
-    eachSelCell(selBox(), i => { frozen[i] = 0; });
+    eachSelCell(selBox(), i => { frozen[i] = 0; rev[i] = 0; });
+  });
+  document.getElementById('sel-reverse').addEventListener('click', () => {
+    if (!selActive) return;
+    eachSelCell(selBox(), i => { if (grid[i] !== E.EMPTY) { rev[i] = 1; frozen[i] = 0; } });
   });
   document.getElementById('sel-deselect').addEventListener('click', () => {
     selActive = false; floating = null; updateSelPanel();
@@ -1208,11 +1237,16 @@ function setupUI() {
       // fire flickers
       const fl = (el === E.FIRE) ? (0.75 + Math.random() * 0.5) : 1;
       let r = c[0] * v * fl, g = c[1] * v * fl, b = c[2] * v * fl;
-      // frozen (gravity off) cells get a frosted blue cast
+      // frozen (gravity off) cells get a frosted blue cast;
+      // reversed-gravity cells get a violet cast
       if (frozen[i] && el !== E.EMPTY) {
         r = r * 0.65 + 150 * 0.35;
         g = g * 0.65 + 220 * 0.35;
         b = b * 0.65 + 255 * 0.35;
+      } else if (rev[i] && el !== E.EMPTY) {
+        r = r * 0.6 + 205 * 0.4;
+        g = g * 0.6 + 80 * 0.4;
+        b = b * 0.6 + 255 * 0.4;
       }
       const j = i * 4;
       px[j]     = Math.min(255, r);

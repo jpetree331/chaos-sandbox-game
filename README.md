@@ -18,9 +18,10 @@ Glass · Bolt (lightning) · Chaos · **Levitite**
 ## Features
 
 - **Tools** — Paint, Erase (with its own width slider), and Select.
-- **Select tool** — drag a box, then **Copy · Cut/Move · Paste · Delete**, or
-  toggle **Gravity Off / Gravity On** for the selected blocks.
-  Keyboard: `C` copy, `X` cut, `V` paste, `Delete` clear, `Esc` cancel.
+- **Select tool** — drag a box, then **Copy · Cut/Move · Paste · Delete**, or set
+  the selected blocks to **Gravity Off / Gravity On / Reverse Gravity** (reversed
+  blocks fall upward). Keyboard: `C` copy, `X` cut, `V` paste, `Delete` clear,
+  `Esc` cancel.
 - **Levitite** (light-cyan, glowing) — the floating block. One Levitite lifts 9
   blocks:
   - balanced → the structure **floats**
