@@ -769,6 +769,7 @@ function updateCell(x, y) {
         if (!inBounds(nx, ny)) continue;
         const n = idx(nx, ny);
         const ne = grid[n];
+        if (ne === E.TNT) { explode(nx, ny, 10); return; }   // acid sets off TNT
         if (ne !== E.EMPTY && ne !== E.ACID && ne !== E.GLASS && Math.random() < 0.12) {
           setCell(nx, ny, Math.random() < 0.3 ? E.SMOKE : E.EMPTY);
           if (Math.random() < 0.5) { setCell(x, y, E.EMPTY); return; }
@@ -794,6 +795,7 @@ function updateCell(x, y) {
         else if (ne === E.ICE) setCell(nx, ny, E.WATER);
         else if (ne === E.TNT) { explode(nx, ny, 10); return; }
         else if (ne === E.SAND && Math.random() < 0.005) setCell(nx, ny, E.GLASS);
+        else if (ne === E.STONE && Math.random() < 0.004) setCell(nx, ny, E.LAVA); // melts slowly
       }
       if (!tryFall(i, x, y, el, gd)) tryFlow(i, x, y, 0.12); // viscous
       return;
@@ -1128,7 +1130,16 @@ function setupUI() {
   });
   document.getElementById('sel-reverse').addEventListener('click', () => {
     if (!selActive) return;
-    eachSelCell(selBox(), i => { if (grid[i] !== E.EMPTY) { rev[i] = 1; frozen[i] = 0; } });
+    const b = selBox();
+    // Toggle: if every filled cell is already reversed, a second press reverts
+    // them to normal gravity; otherwise reverse them all.
+    let allReversed = true, any = false;
+    eachSelCell(b, i => { if (grid[i] !== E.EMPTY) { any = true; if (!rev[i]) allReversed = false; } });
+    const turnOn = !(any && allReversed);
+    eachSelCell(b, i => {
+      if (grid[i] === E.EMPTY) return;
+      if (turnOn) { rev[i] = 1; frozen[i] = 0; } else { rev[i] = 0; }
+    });
   });
   document.getElementById('sel-deselect').addEventListener('click', () => {
     selActive = false; floating = null; updateSelPanel();
